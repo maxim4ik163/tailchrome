@@ -1,0 +1,46 @@
+name: Build patched helper
+
+# Unsigned helper binaries for testing a fix in a fork. Not part of the
+# upstream release pipeline.
+on:
+  push:
+    branches:
+      - "fix-*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version stamped into the helper (match the installed extension to avoid the version notice)
+        default: "0.1.15"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HELPER_VERSION: ${{ inputs.version || '0.1.15' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: host/go.mod
+          cache-dependency-path: host/go.sum
+      - name: Vet
+        working-directory: host
+        run: go vet ./...
+      - name: Tests for the fix
+        working-directory: host
+        run: go test -count=1 -run 'UserPrefs|StartupPrefs|MaskedPrefs' ./...
+      - name: Full host test suite (informational)
+        working-directory: host
+        continue-on-error: true
+        run: go test -count=1 -timeout 20m ./...
+      - name: Build all platforms
+        run: make host-all VERSION="$HELPER_VERSION"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: tailscale-browser-ext-${{ env.HELPER_VERSION }}-patched
+          path: dist/tailscale-browser-ext-*
+          if-no-files-found: error
