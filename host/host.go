@@ -57,6 +57,10 @@ type Host struct {
 	// initID is the browser profile UUID, set during the init command.
 	initID string
 
+	// stateDir is the tsnet state directory of the active session; the
+	// user-prefs sidecar file lives there.
+	stateDir string
+
 	// watchCancel cancels the IPN bus watcher goroutine.
 	watchCancel context.CancelFunc
 
@@ -89,6 +93,12 @@ type Host struct {
 	webChanging bool
 	webActive   map[*http.Request]func()
 	webRequests sync.WaitGroup
+
+	// userPrefsMu serializes writes of the user-prefs sidecar file and
+	// remembers the last content written, to skip redundant writes.
+	userPrefsMu   sync.Mutex
+	userPrefsDir  string
+	userPrefsLast []byte
 
 	proxyAuth     *ProxyAuth
 	proxyListener net.Listener
@@ -403,6 +413,7 @@ func (h *Host) handleInit(req Request) {
 	h.ts = nil
 	h.lc = nil
 	h.watchCancel = nil
+	h.stateDir = ""
 	h.initID = req.InitID
 	h.sessionGeneration++
 	generation := h.sessionGeneration
@@ -444,9 +455,18 @@ func (h *Host) handleInit(req Request) {
 		return
 	}
 
+	// tsnet.Start rebuilds prefs from scratch on every launch, so restore the
+	// user's choices (coordination server first of all) from our sidecar file.
+	savedPrefs, err := loadUserPrefs(stateDir)
+	if err != nil {
+		log.Printf("ignoring saved user prefs: %v", err)
+		savedPrefs = nil
+	}
+
 	server := &tsnet.Server{
 		Dir:          stateDir,
-		Hostname:     "browser-ext",
+		Hostname:     savedPrefs.serverHostname("browser-ext"),
+		ControlURL:   savedPrefs.serverControlURL(),
 		RunWebClient: true,
 		Logf:         log.Printf,
 	}
@@ -473,7 +493,7 @@ func (h *Host) handleInit(req Request) {
 	// are built from accepted PrimaryRoutes, so enable route acceptance before
 	// publishing the first status update.
 	prefsCtx, prefsCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	_, err = lc.EditPrefs(prefsCtx, startupPrefs())
+	_, err = lc.EditPrefs(prefsCtx, startupPrefsWithSaved(savedPrefs))
 	prefsCancel()
 	if err != nil {
 		h.send(Reply{
@@ -509,6 +529,7 @@ func (h *Host) handleInit(req Request) {
 	h.ts = server
 	h.lc = lc
 	h.watchCancel = watchCancel
+	h.stateDir = stateDir
 	h.sessionMu.Unlock()
 	go h.watchIPNBus(watchCtx, lc, generation)
 
@@ -969,25 +990,38 @@ func (h *Host) handleSetPrefs(req Request) {
 		// new ControlURL would carry the old identity to the new server and
 		// the IPN engine could skip the interactive login prompt.
 		logoutCtx, logoutCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		if err := lc.Logout(logoutCtx); err != nil {
-			logoutCancel()
-			log.Printf("logout during controlURL change failed, restoring previous URL: %v", err)
+		logoutErr := lc.Logout(logoutCtx)
+		logoutCancel()
+		if logoutErr != nil {
+			// The previous control server could not confirm the logout: it is
+			// unreachable, or it never knew this node key (for example when a
+			// restart reset ControlURL to the default server while the node key
+			// still belonged to a custom one). Rolling back here used to leave
+			// the user unable to ever change the server again. Instead leave the
+			// old profile behind and continue on a fresh, empty identity, so the
+			// old node key is still never presented to the new server.
+			log.Printf("logout during controlURL change failed (%v); continuing on a new empty profile", logoutErr)
+			emptyCtx, emptyCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			switchErr := lc.SwitchToEmptyProfile(emptyCtx)
+			emptyCancel()
+			if switchErr != nil {
+				log.Printf("switch to empty profile failed, restoring previous URL: %v", switchErr)
 
-			rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			rollbackErr := lc.Start(rollbackCtx, ipn.Options{UpdatePrefs: currentPrefs})
-			rollbackCancel()
-			if rollbackErr != nil {
+				rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				rollbackErr := lc.Start(rollbackCtx, ipn.Options{UpdatePrefs: currentPrefs})
+				rollbackCancel()
+				if rollbackErr != nil {
+					h.clearCachedStatus(currentPrefs)
+					h.sendError("set-prefs", fmt.Sprintf("failed to logout before changing control URL: %v; could not start a new profile: %v; also failed to restore previous control URL: %v", logoutErr, switchErr, rollbackErr))
+					return
+				}
+
 				h.clearCachedStatus(currentPrefs)
-				h.sendError("set-prefs", fmt.Sprintf("failed to logout before changing control URL: %v; also failed to restore previous control URL: %v", err, rollbackErr))
+				h.handleGetStatus()
+				h.sendError("set-prefs", fmt.Sprintf("failed to logout before changing control URL: %v; could not start a new profile: %v; restored previous control URL", logoutErr, switchErr))
 				return
 			}
-
-			h.clearCachedStatus(currentPrefs)
-			h.handleGetStatus()
-			h.sendError("set-prefs", fmt.Sprintf("failed to logout before changing control URL: %v; restored previous control URL", err))
-			return
 		}
-		logoutCancel()
 
 		restartCtx, restartCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		if err := lc.Start(restartCtx, ipn.Options{UpdatePrefs: updatedPrefs}); err != nil {

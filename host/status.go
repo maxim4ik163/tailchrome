@@ -110,6 +110,9 @@ func (h *Host) watchIPNBusSession(ctx context.Context, lc *local.Client, generat
 
 		stateChanged := n.State != nil
 		prefsChanged := n.Prefs != nil && n.Prefs.Valid()
+		if prefsChanged {
+			h.persistUserPrefs(lc, generation, *n.Prefs)
+		}
 		browseURLChanged := n.BrowseToURL != nil
 		healthChanged := n.Health != nil
 		netMapChanged := n.NetMap != nil || n.SelfChange != nil
